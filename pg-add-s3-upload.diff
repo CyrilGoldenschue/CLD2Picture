@@ -1,0 +1,175 @@
+diff --git a/app/Http/Controllers/PictureController.php b/app/Http/Controllers/PictureController.php
+index 8f7d0cd..e263008 100644
+--- a/app/Http/Controllers/PictureController.php
++++ b/app/Http/Controllers/PictureController.php
+@@ -26,7 +26,26 @@ class PictureController extends Controller
+      */
+     public function create()
+     {
+-      return view('pictures.create');
++      $awsClient = new \Aws\S3\S3Client([
++        'version' => 'latest',
++        'region' => env('AWS_DEFAULT_REGION'),
++      ]);
++      $bucket = env('AWS_BUCKET');
++      $key = "pictures/" . \Str::random(40);
++      $formInputs = ['acl' => 'private', 'key' => $key];
++      $options = [
++          ['acl' => 'private'],
++          ['bucket' => $bucket],
++          ['eq', '$key', $key],
++      ];      
++      $postObject = new \Aws\S3\PostObjectV4(
++        $awsClient, $bucket, $formInputs, $options, "+1 hours"
++      );
++      
++      return view('pictures.create', [
++        's3attributes' => $postObject->getFormAttributes(),
++        's3inputs' => $postObject->getFormInputs(),
++      ]);
+     }
+ 
+     /**
+@@ -39,7 +58,6 @@ class PictureController extends Controller
+     {
+       $picture = new Picture;
+       $picture->fill($request->all());
+-      $picture->storage_path = $request->picture->store('pictures');
+       $picture->save();
+     }
+ 
+@@ -52,7 +70,7 @@ class PictureController extends Controller
+     public function show(Request $request, Picture $picture)
+     {
+       if (\Str::startsWith($request->header('Accept'), 'image')) {
+-        return \Storage::get($picture->storage_path);
++        return redirect(\Storage::disk('s3')->temporaryUrl($picture->storage_path, now()->addMinutes(1)));
+       }
+       
+       return view('pictures.show', compact('picture'));
+diff --git a/app/Http/Requests/PictureRequest.php b/app/Http/Requests/PictureRequest.php
+index cf15989..8470b26 100644
+--- a/app/Http/Requests/PictureRequest.php
++++ b/app/Http/Requests/PictureRequest.php
+@@ -25,7 +25,7 @@ class PictureRequest extends FormRequest
+     {
+         return [
+           'title' => 'required|string|max:42',
+-          'picture' => 'required|image'
++          'storage_path' => 'required|string'
+         ];
+     }
+ }
+diff --git a/app/Picture.php b/app/Picture.php
+index dcb018a..444ad9d 100644
+--- a/app/Picture.php
++++ b/app/Picture.php
+@@ -8,6 +8,7 @@ class Picture extends Model
+ {
+   protected $fillable = [
+     'title',
++    'storage_path',
+   ];
+ 
+ }
+diff --git a/composer.json b/composer.json
+index 0ed2dc5..45931e4 100644
+--- a/composer.json
++++ b/composer.json
+@@ -11,7 +11,8 @@
+         "php": "^7.2",
+         "fideloper/proxy": "^4.0",
+         "laravel/framework": "^6.2",
+-        "laravel/tinker": "^2.0"
++        "laravel/tinker": "^2.0",
++        "league/flysystem-aws-s3-v3": "^1.0"
+     },
+     "require-dev": {
+         "facade/ignition": "^1.4",
+diff --git a/public/js/s3upload.js b/public/js/s3upload.js
+new file mode 100644
+index 0000000..87843ba
+--- /dev/null
++++ b/public/js/s3upload.js
+@@ -0,0 +1,24 @@
++document.querySelector('.s3upload').addEventListener('submit', async function(event) {
++  var form = this;
++  var file_input = form.querySelector('input[type=file]');
++  if (!file_input) { return; }
++  
++  event.preventDefault();
++  
++  var attributes = JSON.parse(form.dataset.s3attributes);
++  var inputs = JSON.parse(form.dataset.s3inputs);
++  
++  var data = new FormData();
++  for (input in inputs) {
++    data.append(input, inputs[input]);
++  }
++  data.append('file', file_input.files[0]);
++
++  var response = await fetch(attributes['action'], {method: attributes['method'], body: data})
++  if (response.ok) {
++    file_input.remove();
++    form.submit();
++  } else {
++    console.log("Fail "+response.status);
++  }
++});
+diff --git a/resources/views/layouts/app.blade.php b/resources/views/layouts/app.blade.php
+new file mode 100644
+index 0000000..5f7cf66
+--- /dev/null
++++ b/resources/views/layouts/app.blade.php
+@@ -0,0 +1,21 @@
++<!DOCTYPE html>
++<html lang="{{ app()->getLocale() }}">
++<head>
++    <meta charset="utf-8">
++    <meta http-equiv="X-UA-Compatible" content="IE=edge">
++    <meta name="viewport" content="width=device-width, initial-scale=1">
++
++    <!-- CSRF Token -->
++    <meta name="csrf-token" content="{{ csrf_token() }}">
++
++    <title>{{ config('app.name', 'Laravel') }}</title>
++
++    <!-- Styles -->
++    <link href="{{ asset('css/app.css') }}" rel="stylesheet">
++    @stack('styles')
++</head>
++<body>
++    @yield('content')
++    @stack('scripts')
++</body>
++</html>
+\ No newline at end of file
+diff --git a/resources/views/pictures/create.blade.php b/resources/views/pictures/create.blade.php
+index d810d71..7b009ef 100644
+--- a/resources/views/pictures/create.blade.php
++++ b/resources/views/pictures/create.blade.php
+@@ -1,12 +1,19 @@
+-<form action="{{ route('pictures.store') }}" method="POST" enctype="multipart/form-data">
++@extends('layouts/app')
++
++@push('scripts')
++  <script src="/js/s3upload.js"></script>
++@endpush
++
++@section('content')
++<form class="s3upload" action="{{ route('pictures.store') }}" method="POST" enctype="multipart/form-data"
++data-s3attributes="{{ json_encode($s3attributes) }}" data-s3inputs="{{ json_encode($s3inputs) }}">
+   @csrf
+   <input type="text" name="title" />
+   @error('title')
+       <div class="alert alert-danger">{{ $message }}</div>
+   @enderror
+-  <input type="file" name="picture"/>
+-  @error('picture')
+-      <div class="alert alert-danger">{{ $message }}</div>
+-  @enderror
++  <input type="file" name="file"/>
++  <input type="hidden" name="storage_path" value="{{ $s3inputs['key'] }}">
+   <input type="submit" />
+ </form>
++@endsection
